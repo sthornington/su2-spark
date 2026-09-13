@@ -10,7 +10,7 @@ USER root
 
 # Keep Galaxy's user and development tools, with a SU2 build toolchain.
 # CUDA, nvcc, PyTorch and HPC-X MPI come from the NVIDIA image.
-# SU2_CFD itself will be built and validated in the persistent workspace.
+# SU2_CFD is compiled below and installed outside the mutable workspace.
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     build-essential ca-certificates cmake curl emacs-nox gfortran gh git \
     gdb jq less libcgns-dev libhdf5-dev libmetis-dev libopenblas-dev \
@@ -43,6 +43,56 @@ RUN printf '\nexport PROMPT_COMMAND="history -a${PROMPT_COMMAND:+; $PROMPT_COMMA
 
 USER root
 COPY --from=tusd /usr/local/bin/tusd /usr/local/bin/tusd
+
+# SU2 8.5.0, pinned including its Eigen, MEL and Meson submodule revisions.
+# CUDA currently accelerates the FGMRES matrix-vector product, not every CFD stage.
+ARG SU2_COMMIT=12eb826f049ef7f67df974dfcb44cf36ee07c0f8
+ARG SU2_CUDA_ARCH=sm_121
+ARG SU2_BUILD_JOBS=20
+RUN git init /opt/su2/src \
+    && git -C /opt/su2/src remote add origin https://github.com/su2code/SU2.git \
+    && git -C /opt/su2/src fetch --depth 1 origin "${SU2_COMMIT}" \
+    && git -C /opt/su2/src checkout --detach FETCH_HEAD \
+    && test "$(git -C /opt/su2/src rev-parse HEAD)" = "${SU2_COMMIT}" \
+    && git -C /opt/su2/src submodule update --init --depth 1 externals/meson externals/eigen externals/mel
+WORKDIR /opt/su2/src
+# Upstream hardcodes Ampere sm_86 and mistakes nvcc's GCC compatibility macros
+# for support for OpenMP atomic compare. Use its existing critical-section fallback
+# in CUDA translation units, while retaining GCC's atomic operations in C++ units.
+RUN python3 - "${SU2_CUDA_ARCH}" <<'PY'
+from pathlib import Path
+import re, sys
+arch = sys.argv[1]
+assert re.fullmatch(r'sm_[0-9]+[a-z]?', arch), 'Invalid CUDA architecture'
+path = Path('meson.build')
+text = path.read_text()
+assert text.count('-arch=sm_86') == 1
+path.write_text(text.replace('-arch=sm_86', '-arch=' + arch))
+path = Path('Common/include/parallelization/omp_structure.hpp')
+text = path.read_text()
+assert text.count('#if __GNUC__ > 11') == 1
+path.write_text(text.replace('#if __GNUC__ > 11', '#if __GNUC__ > 11 && !defined(__CUDACC__)'))
+PY
+RUN python3 preconfigure.py --no-codi --no-medi --no-opdi --no-mpp \
+        --no-coolprop --no-mel --no-fado --no-mlpcpp --no-eigen \
+    && python3 externals/meson/meson.py setup build --prefix=/opt/su2 \
+        --buildtype=release -Dwith-mpi=enabled -Dwith-omp=true \
+        -Denable-cuda=true -Dcuda_std=c++17 -Denable-tecio=false \
+        -Denable-cgns=true -Denable-autodiff=false -Denable-tests=false \
+    && ninja -C build -j "${SU2_BUILD_JOBS}" \
+    && ninja -C build install \
+    && /opt/su2/bin/SU2_CFD --help \
+    && cuobjdump --list-elf /opt/su2/bin/SU2_CFD | grep -F "${SU2_CUDA_ARCH}" \
+    && install -d /opt/su2/share \
+    && cp -r QuickStart /opt/su2/share/ \
+    && git diff > /opt/su2/share/spark-build.patch \
+    && printf 'commit=%s\ncuda_arch=%s\nmpi=enabled\nopenmp=true\n' \
+        "${SU2_COMMIT}" "${SU2_CUDA_ARCH}" > /opt/su2/share/build-info.txt \
+    && rm -rf build
+# The CUDA path is validated with one OpenMP thread; CPU cases can override it.
+ENV SU2_HOME=/opt/su2/src SU2_RUN=/opt/su2/bin OMP_NUM_THREADS=1
+ENV PATH="/opt/su2/bin:${PATH}"
+
 # Durable, bidirectional mailbox; no daemon or additional network port needed.
 # SQLite lives on the Spark's local Docker volume, never on an SSH/NFS filesystem.
 COPY --chmod=755 <<'PY' /usr/local/bin/astra-mail
@@ -225,8 +275,12 @@ Claims expire after interruption: delivery can repeat. Use the message ID for
 job directories and check saved state before rerunning any simulation. Use
 stable send --key values to deduplicate retried messages. Read prior chat with
 astra-mail history --peer spark --after LAST_SEEN_ID.
-SU2_CFD is not installed yet. Build and validate its CUDA support explicitly;
-do not infer SU2 GPU execution or simulation validity from PyTorch GPU access.
+SU2_CFD 8.5.0 is installed in /opt/su2/bin with CUDA, MPI and OpenMP enabled.
+Use ENABLE_CUDA=YES and LINEAR_SOLVER=FGMRES in the case config to enable its
+CUDA matrix-vector products. Other CFD stages still run on the CPU. Start with
+one MPI rank and one OpenMP thread for CUDA cases. The upstream QuickStart case
+is in /opt/su2/share/QuickStart; build provenance is in /opt/su2/share/build-info.txt.
+Validate each simulation; GPU execution alone does not establish CFD accuracy.
 MD
 
 # TLS and the Codex WebSocket API run in this container as the development user.
@@ -328,8 +382,10 @@ Downloads support byte ranges for resuming.</p>
 Run it again with the same arguments after interruption to resume:</p>
 <pre>python3 upload.py --url https://HOST:8765 \
   --certificate su2-spark.crt --token-file su2-spark.token mesh.su2</pre>
-<p>Simulation files persist under <code>/workspace</code>. SU2 installation and
-CUDA validation are the first tasks for this development environment.</p>
+<p>SU2_CFD 8.5.0 is installed with CUDA support for the Spark. Enable
+<code>ENABLE_CUDA=YES</code> and <code>LINEAR_SOLVER=FGMRES</code> in the case
+configuration. CUDA accelerates matrix-vector operations; other solver stages
+remain on the CPU. Simulation files persist under <code>/workspace</code>.</p>
 </html>
 HTML
 
@@ -451,6 +507,23 @@ set -euo pipefail
 umask 077
 state=/var/lib/astra-mail/api
 mkdir -p "$state" /tmp/astra-api /workspace/uploads /workspace/exports
+# Update only the obsolete solver note in an existing Codex volume, preserving
+# any owner edits and the rest of its persistent configuration.
+python3 - <<'PY'
+from pathlib import Path
+path = Path('/home/sthornington/.codex/AGENTS.md')
+old = ('SU2_CFD is not installed yet. Build and validate its CUDA support explicitly;\n'
+       'do not infer SU2 GPU execution or simulation validity from PyTorch GPU access.')
+new = ('SU2_CFD 8.5.0 is installed in /opt/su2/bin with CUDA, MPI and OpenMP.\n'
+       'Use ENABLE_CUDA=YES and LINEAR_SOLVER=FGMRES; start with one MPI rank\n'
+       'and one OpenMP thread. CUDA accelerates matrix-vector products; other\n'
+       'CFD stages run on the CPU. See /opt/su2/share/build-info.txt and QuickStart.\n'
+       'Validate each simulation; GPU execution alone does not establish CFD accuracy.')
+if path.exists():
+    text = path.read_text()
+    if old in text:
+        path.write_text(text.replace(old, new))
+PY
 if [[ ! -s "$state/token" ]]; then
     python3 -c 'import secrets; print(secrets.token_urlsafe(48))' > "$state/token.tmp"
     mv "$state/token.tmp" "$state/token"
