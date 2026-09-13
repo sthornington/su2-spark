@@ -574,7 +574,12 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 143' TERM
 trap 'exit 130' INT
-codex app-server -c 'model="gpt-6-astra"' --listen ws://127.0.0.1:8766 \
+# Docker supplies the execution boundary. Its default seccomp policy blocks
+# the user namespaces needed by Codex's nested bwrap sandbox. Keep Docker's
+# isolation intact and let the unprivileged agent execute within the container.
+codex app-server -c 'model="gpt-6-astra"' \
+    -c 'sandbox_mode="danger-full-access"' -c 'approval_policy="never"' \
+    --listen ws://127.0.0.1:8766 \
     --ws-auth capability-token --ws-token-file "$state/token" &
 children+=("$!")
 tusd -host 127.0.0.1 -port 8767 -base-path /uploads/ \
