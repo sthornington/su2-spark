@@ -315,6 +315,13 @@ http {
             root /usr/local/share/astra-api;
             default_type text/plain;
         }
+        location = /transcript {
+            alias /usr/local/share/astra-api/transcript.html;
+            default_type text/html;
+            add_header Cache-Control "no-store" always;
+            add_header X-Content-Type-Options "nosniff" always;
+            add_header Content-Security-Policy "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'" always;
+        }
         location = /rpc {
             if ($astra_authorized = 0) { return 401; }
             proxy_pass http://127.0.0.1:8766/;
@@ -368,7 +375,8 @@ certificate and an <code>Authorization: Bearer TOKEN</code> handshake header.</p
 streaming responses. Use <code>turn/steer</code> to add input during active work.
 Save the thread ID to reconnect to the same conversation.</p>
 <p><a href="https://learn.chatgpt.com/docs/app-server">Codex API protocol</a> ·
-<a href="/readyz">Readiness</a> · <a href="/healthz">Health</a></p>
+<a href="/readyz">Readiness</a> · <a href="/healthz">Health</a> ·
+<a href="/transcript">Live conversation transcript</a></p>
 <h2>Large meshes and results</h2>
 <p><code>POST /uploads/</code> creates a <a href="https://tus.io/protocols/resumable-upload">tus resumable upload</a>.
 Stream bytes with <code>PATCH</code>; after a disconnect, use <code>HEAD</code>
@@ -388,6 +396,102 @@ configuration. CUDA accelerates matrix-vector operations; other solver stages
 remain on the CPU. Simulation files persist under <code>/workspace</code>.</p>
 </html>
 HTML
+
+# Public viewer; conversation data requires the existing bearer token.
+COPY <<'TRANSCRIPT_HTML' /usr/local/share/astra-api/transcript.html
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Mac Astra ↔ Spark Astra · Live transcript</title>
+<style>
+body{font:16px/1.6 system-ui;margin:0;background:#101820;color:#e8edf4}
+[hidden]{display:none!important}
+main{max-width:960px;margin:32px auto;padding:0 20px}h1{font-size:28px}
+header p,#status{color:#acbbcc}article{background:#192632;border-left:4px solid #69b7c8;border-radius:8px;padding:18px 22px;margin:20px 0}
+article.mac{border-color:#bea0f0}h2{font-size:14px;color:#a9c4db;margin:0 0 12px}
+pre{font:15px/1.65 system-ui;white-space:pre-wrap;overflow-wrap:anywhere;margin:0}
+.controls{position:sticky;top:0;background:#101820f5;padding:12px 0;z-index:1}
+button,input[type=password]{font:inherit;padding:7px 12px;border:1px solid #668199;border-radius:5px}
+button{background:#233c4e;color:#fff;cursor:pointer}input[type=password]{background:#192632;color:#fff;max-width:100%;box-sizing:border-box}
+form{display:flex;gap:10px;flex-wrap:wrap;align-items:center}#disconnect{margin-left:16px}
+</style>
+</head>
+<body><main>
+<header><h1>Mac Astra ↔ Spark Astra</h1>
+<p>Their shared Spark conversation, updated every three seconds. Times are Eastern.</p></header>
+<form id="login">
+<label for="token">Container API token</label>
+<input id="token" type="password" autocomplete="off" spellcheck="false" required aria-label="Container API token">
+<button type="submit">Open transcript</button>
+</form>
+<div class="controls" id="controls" hidden>
+<label><input id="follow" type="checkbox" checked> Follow latest messages</label>
+<button type="button" id="disconnect">Disconnect</button>
+</div>
+<p id="status" role="status">Enter the container token to view the conversation. It is kept only in this tab’s memory.</p>
+<section id="messages" aria-label="Conversation transcript"></section>
+</main>
+<script>
+'use strict';
+const login=document.getElementById('login'), tokenInput=document.getElementById('token');
+const controls=document.getElementById('controls'), follow=document.getElementById('follow');
+const status=document.getElementById('status'), messages=document.getElementById('messages');
+const format=new Intl.DateTimeFormat('en-US',{timeZone:'America/New_York',dateStyle:'medium',timeStyle:'medium'});
+let token='', generation=0, lastMessages='', timer=null, controller=null;
+function disconnect(){
+  generation++;token='';tokenInput.value='';lastMessages='';
+  clearTimeout(timer);if(controller)controller.abort();
+  messages.replaceChildren();controls.hidden=true;login.hidden=false;
+  status.textContent='Disconnected. Enter the container token to view the conversation.';
+}
+async function refresh(current){
+  const requestController=new AbortController();controller=requestController;
+  const timeout=setTimeout(()=>requestController.abort(),10000);
+  try{
+    const response=await fetch('/files/astra-transcript.json',{
+      headers:{Authorization:'Bearer '+token},cache:'no-store',signal:requestController.signal
+    });
+    if(current!==generation)return;
+    if(response.status===401){disconnect();status.textContent='The container token was not accepted.';return;}
+    if(!response.ok)throw new Error('HTTP '+response.status);
+    const data=await response.json();
+    if(current!==generation)return;
+    const encoded=JSON.stringify(data.messages);
+    if(encoded!==lastMessages){
+      const fragment=document.createDocumentFragment();
+      for(const message of data.messages){
+        const article=document.createElement('article');
+        article.className=message.speaker==='Mac Astra'?'mac':'spark';
+        const heading=document.createElement('h2');
+        heading.textContent=format.format(new Date(message.timestamp))+' ET · '+message.speaker;
+        const body=document.createElement('pre');body.textContent=message.text;
+        article.append(heading,body);fragment.append(article);
+      }
+      messages.replaceChildren(fragment);lastMessages=encoded;
+      if(follow.checked)window.scrollTo(0,document.body.scrollHeight);
+    }
+    const age=Date.now()-Date.parse(data.checked_at);
+    const activity=age>20000?'Transcript updates are delayed.':
+      data.active?'Spark is working on a turn.':'Last turn completed; waiting for the coordinator.';
+    status.textContent=activity+' Last checked: '+format.format(new Date(data.checked_at))+' ET.';
+  }catch(error){
+    if(current===generation)status.textContent='Unable to refresh the transcript. Retrying shortly; previous messages remain visible.';
+  }finally{
+    clearTimeout(timeout);
+    if(current===generation&&token)timer=setTimeout(()=>refresh(current),3000);
+  }
+}
+login.addEventListener('submit',event=>{
+  event.preventDefault();const entered=tokenInput.value.trim();disconnect();
+  if(!entered)return;
+  token=entered;login.hidden=true;controls.hidden=false;
+  status.textContent='Loading conversation…';refresh(generation);
+});
+document.getElementById('disconnect').addEventListener('click',disconnect);
+</script></body></html>
+TRANSCRIPT_HTML
 
 # This client is served by the container for use on the Mac; it needs no Docker.
 COPY <<'PY' /usr/local/share/astra-api/upload.py
